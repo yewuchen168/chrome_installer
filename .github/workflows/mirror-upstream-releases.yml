@@ -1,0 +1,132 @@
+name: Mirror Upstream Releases (assets -> my repo + artifact)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "Upstream repo (owner/repo)"
+        required: true
+        default: "Bush2021/chrome_installer"
+      include_prereleases:
+        description: "Include prereleases?"
+        required: false
+        default: "false"
+      max_releases:
+        description: "Mirror at most N releases (0 = all)"
+        required: false
+        default: "0"
+
+permissions:
+  contents: write    # 需要写权限才能创建/更新 Release
+
+concurrency:
+  group: mirror-releases
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # gh CLI 用它来认证
+      SRC_REPO: ${{ github.event.inputs.source_repo }}
+      INCLUDE_PRERELEASES: ${{ github.event.inputs.include_prereleases }}
+      MAX_RELEASES: ${{ github.event.inputs.max_releases }}
+      DEST_REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout (optional)
+        uses: actions/checkout@v4
+
+      - name: Show inputs
+        run: |
+          echo "SRC_REPO=${SRC_REPO}"
+          echo "DEST_REPO=${DEST_REPO}"
+          echo "INCLUDE_PRERELEASES=${INCLUDE_PRERELEASES}"
+          echo "MAX_RELEASES=${MAX_RELEASES}"
+
+      - name: Install jq (for JSON processing)
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Fetch releases list from upstream
+        id: list
+        shell: bash
+        run: |
+          set -e
+          mkdir -p mirror
+          # 拉取所有 releases（包含分页）
+          gh api "repos/${SRC_REPO}/releases?per_page=100" --paginate > mirror/_releases.json
+
+          # 过滤是否包含 pre-release
+          if [ "${INCLUDE_PRERELEASES}" = "true" ]; then
+            jq '.[]' mirror/_releases.json > mirror/_releases_filtered.json
+          else
+            jq '.[] | select(.prerelease == false)' mirror/_releases.json > mirror/_releases_filtered.json
+          fi
+
+          COUNT=$(jq -s 'length' mirror/_releases_filtered.json)
+          echo "Total releases (after filter): $COUNT"
+
+          # 控制最大数量（按发布时间从新到旧）
+          if [ "${MAX_RELEASES}" != "0" ]; then
+            jq -s 'sort_by(.published_at) | reverse | .[:('"${MAX_RELEASES}"')] | .[]' mirror/_releases_filtered.json \
+              > mirror/_releases_final.json
+          else
+            jq -s 'sort_by(.published_at) | reverse | .[]' mirror/_releases_filtered.json \
+              > mirror/_releases_final.json
+          fi
+
+          FINAL_COUNT=$(jq -s 'length' mirror/_releases_final.json)
+          echo "Will mirror: $FINAL_COUNT releases"
+          echo "count=$FINAL_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Mirror loop (download assets from upstream, upload to my releases)
+        shell: bash
+        run: |
+          set -e
+          i=0
+          jq -c '.' mirror/_releases_final.json | while read -r rel; do
+            i=$((i+1))
+            TAG=$(echo "$rel" | jq -r '.tag_name')
+            NAME=$(echo "$rel" | jq -r '.name // .tag_name')
+            BODY=$(echo "$rel" | jq -r '.body // ""')
+
+            echo "[$i] === Tag: $TAG | Name: $NAME"
+
+            # 1) 从上游下载该 tag 的所有资产到本地
+            mkdir -p "mirror/$TAG"
+            echo "Downloading assets from ${SRC_REPO}@$TAG ..."
+            # --skip-existing 避免重复下载
+            gh release download "$TAG" -R "$SRC_REPO" -D "mirror/$TAG" --skip-existing || true
+            ls -lh "mirror/$TAG" || true
+
+            # 如果没有任何文件，跳过（可能是空 release）
+            if [ -z "$(ls -A "mirror/$TAG" 2>/dev/null)" ]; then
+              echo "No assets for $TAG, skip uploading"
+              continue
+            fi
+
+            # 2) 在自己仓库创建同名 release（如果不存在）
+            if gh release view "$TAG" -R "$DEST_REPO" >/dev/null 2>&1; then
+              echo "Release ${DEST_REPO}@$TAG already exists."
+            else
+              echo "Creating release ${DEST_REPO}@$TAG ..."
+              # 尽量复刻原 release 的标题与说明
+              gh release create "$TAG" -R "$DEST_REPO" \
+                -t "$NAME" \
+                -n "$BODY" || gh release create "$TAG" -R "$DEST_REPO"
+            fi
+
+            # 3) 上传资产到我的 release（覆盖同名文件）
+            echo "Uploading assets to ${DEST_REPO}@$TAG ..."
+            # 逐文件上传，遇到相同文件名用 --clobber 覆盖
+            find "mirror/$TAG" -type f -maxdepth 1 | while read -r f; do
+              echo "  -> $(basename "$f")"
+              gh release upload "$TAG" "$f" -R "$DEST_REPO" --clobber || true
+            done
+          done
+
+      - name: Upload everything as a single artifact (backup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: mirrored-releases
+          path: mirror/**
+          if-no-files-found: warn
